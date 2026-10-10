@@ -5,6 +5,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 import requests
 
@@ -241,6 +242,158 @@ with patch("weather_journal.fetch.requests.get", side_effect=AssertionError("API
             cmd_log(SimpleNamespace(city="FakeCity", key="fake-key", db="test.db"))
 
         self.assertEqual(out.getvalue().strip(), "Error fetching weather: City 'FakeCity' not found.")
+
+    @staticmethod
+    def _weather_response(temp, name="London"):
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "id": 2643743,
+            "name": name,
+            "coord": {"lat": 51.5074, "lon": -0.1278},
+            "sys": {"country": "GB"},
+            "main": {"temp": temp, "humidity": 70},
+            "weather": [{"description": "clear sky"}],
+        }
+        return response
+
+    @patch("weather_journal.fetch.requests.get")
+    def test_same_city_isolated_across_cache_paths(self, mock_get):
+        # Two distinct SQLite cache paths must not share in-memory entries.
+        other_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(other_dir.cleanup)
+        other_path = Path(other_dir.name) / "other-weather.db"
+
+        mock_get.side_effect = [self._weather_response(11.1), self._weather_response(22.2)]
+
+        first = get_current("London", api_key="fake-key", cache_path=self.cache_path)
+        second = get_current("London", api_key="fake-key", cache_path=other_path)
+
+        self.assertEqual(mock_get.call_count, 2)
+        self.assertEqual(first["temp"], 11.1)
+        self.assertEqual(second["temp"], 22.2)
+        self.assertTrue(other_path.exists())
+
+        # Each cache path keeps its own persisted row for the same city key.
+        for path, expected in ((self.cache_path, 11.1), (other_path, 22.2)):
+            conn = sqlite3.connect(str(path))
+            try:
+                row = conn.execute(
+                    "SELECT payload FROM weather_cache WHERE city_key = ?",
+                    ("london",),
+                ).fetchone()
+            finally:
+                conn.close()
+            self.assertIsNotNone(row)
+            self.assertIn(f'"temp":{expected}', row[0])
+
+    @patch("weather_journal.fetch.requests.get")
+    def test_repeated_requests_reuse_memory_cache_per_path(self, mock_get):
+        from weather_journal import fetch
+
+        mock_get.return_value = self._weather_response(18.5)
+
+        results = [get_current("London", api_key="fake-key", cache_path=self.cache_path)
+                   for _ in range(3)]
+
+        self.assertEqual(mock_get.call_count, 1)
+        self.assertTrue(all(r == results[0] for r in results))
+
+        # The entry is served from the process-local cache first, before SQLite.
+        key = fetch._memory_key("london", self.cache_path)
+        self.assertIn(key, _cache)
+        # Scoped keys: a different path must not collide with this entry.
+        self.assertNotIn(fetch._memory_key("london", Path(self.temp_dir.name) / "x.db"), _cache)
+
+    @patch("weather_journal.fetch.requests.get")
+    def test_expired_memory_entry_is_refreshed(self, mock_get):
+        from weather_journal import fetch
+
+        mock_get.side_effect = [self._weather_response(5.0), self._weather_response(6.0)]
+
+        get_current("London", api_key="fake-key", cache_path=self.cache_path)
+        key = fetch._memory_key("london", self.cache_path)
+        fetched_at, data = _cache[key]
+        # Force both the memory entry and the persistent row past the TTL so the
+        # refresh must go all the way back to the API.
+        _cache[key] = (fetched_at - fetch.CACHE_TTL_SECONDS - 1, data)
+        conn = sqlite3.connect(str(self.cache_path))
+        try:
+            conn.execute("UPDATE weather_cache SET fetched_at = 0")
+            conn.commit()
+        finally:
+            conn.close()
+
+        result = get_current("London", api_key="fake-key", cache_path=self.cache_path)
+
+        self.assertEqual(mock_get.call_count, 2)
+        self.assertEqual(result["temp"], 6.0)
+        self.assertEqual(_cache[key][1]["temp"], 6.0)
+
+    @patch.dict("os.environ", {}, clear=True)
+    @patch("weather_journal.fetch.requests.get")
+    def test_env_configured_cache_path_is_isolated_in_memory(self, mock_get):
+        from weather_journal import fetch
+
+        env_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(env_dir.cleanup)
+        env_path = Path(env_dir.name) / "env-weather.db"
+
+        with patch.dict("os.environ", {"WEATHER_JOURNAL_CACHE": str(env_path)}):
+            mock_get.side_effect = [self._weather_response(30.0), self._weather_response(31.0)]
+            get_current("London", api_key="fake-key")
+            # Same city, explicit distinct path: must not reuse the env entry.
+            direct = get_current("London", api_key="fake-key", cache_path=self.cache_path)
+
+        self.assertEqual(mock_get.call_count, 2)
+        self.assertEqual(direct["temp"], 31.0)
+        self.assertIn(fetch._memory_key("london", env_path), _cache)
+        self.assertIn(fetch._memory_key("london", self.cache_path), _cache)
+
+    @patch("weather_journal.fetch.requests.get")
+    def test_persistent_corrupt_payload_is_dropped_and_refetched(self, mock_get):
+        mock_get.return_value = self._weather_response(12.0)
+        get_current("London", api_key="fake-key", cache_path=self.cache_path)
+        _cache.clear()
+
+        conn = sqlite3.connect(str(self.cache_path))
+        try:
+            conn.execute("UPDATE weather_cache SET payload = ?", ("not-json",))
+            conn.commit()
+        finally:
+            conn.close()
+
+        mock_get.return_value = self._weather_response(13.0)
+        result = get_current("London", api_key="fake-key", cache_path=self.cache_path)
+
+        self.assertEqual(result["temp"], 13.0)
+        self.assertEqual(mock_get.call_count, 2)
+
+        conn = sqlite3.connect(str(self.cache_path))
+        try:
+            row = conn.execute(
+                "SELECT payload FROM weather_cache WHERE city_key = ?", ("london",)
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertIn('"temp":13.0', row[0])
+
+    @patch("weather_journal.fetch.requests.get")
+    def test_persistent_future_timestamp_is_refetched(self, mock_get):
+        mock_get.side_effect = [self._weather_response(14.0), self._weather_response(15.0)]
+        get_current("London", api_key="fake-key", cache_path=self.cache_path)
+        _cache.clear()
+
+        conn = sqlite3.connect(str(self.cache_path))
+        try:
+            conn.execute("UPDATE weather_cache SET fetched_at = ?", (time.time() + 10_000,))
+            conn.commit()
+        finally:
+            conn.close()
+
+        result = get_current("London", api_key="fake-key", cache_path=self.cache_path)
+
+        self.assertEqual(result["temp"], 15.0)
+        self.assertEqual(mock_get.call_count, 2)
 
 if __name__ == "__main__":
     unittest.main()

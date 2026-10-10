@@ -22,6 +22,16 @@ def _cache_path(cache_path=None):
     return Path(configured_path) if configured_path else DEFAULT_CACHE_PATH
 
 
+def _memory_key(city_key, cache_path):
+    """Build an in-memory cache key scoped to the resolved SQLite cache path.
+
+    The process-local cache is shared across every configured cache path, so it
+    must never be keyed by city alone or one cache configuration would serve
+    another configuration's entry.
+    """
+    return str(_cache_path(cache_path)), city_key
+
+
 def _connect_cache(cache_path):
     path = _cache_path(cache_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -39,7 +49,8 @@ def _connect_cache(cache_path):
 
 
 def _read_cache(city_key, cache_path, now):
-    memory_entry = _cache.get(city_key)
+    memory_key = _memory_key(city_key, cache_path)
+    memory_entry = _cache.get(memory_key)
     if memory_entry and now - memory_entry[0] < CACHE_TTL_SECONDS:
         return memory_entry[1]
 
@@ -67,7 +78,7 @@ def _read_cache(city_key, cache_path, now):
     finally:
         conn.close()
 
-    _cache[city_key] = (fetched_at, data)
+    _cache[memory_key] = (fetched_at, data)
     return data
 
 
@@ -85,7 +96,7 @@ def _write_cache(city_key, data, cache_path, fetched_at):
         conn.commit()
     finally:
         conn.close()
-    _cache[city_key] = (fetched_at, data)
+    _cache[_memory_key(city_key, cache_path)] = (fetched_at, data)
 
 
 def get_current(city, api_key=None, cache_path=None):
