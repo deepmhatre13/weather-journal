@@ -231,13 +231,13 @@ with patch("weather_journal.fetch.requests.get", side_effect=AssertionError("API
     def test_cmd_log_error_output(self, mock_get_current):
         from io import StringIO
         from types import SimpleNamespace
-        from contextlib import redirect_stdout
+        from contextlib import redirect_stderr
         from weather_journal.cli import cmd_log
 
         mock_get_current.side_effect = ValueError("City 'FakeCity' not found.")
 
         out = StringIO()
-        with redirect_stdout(out):
+        with redirect_stderr(out):
             cmd_log(SimpleNamespace(city="FakeCity", key="fake-key", db="test.db"))
 
         self.assertEqual(out.getvalue().strip(), "Error fetching weather: City 'FakeCity' not found.")

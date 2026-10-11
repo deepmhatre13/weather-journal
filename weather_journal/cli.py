@@ -11,6 +11,9 @@ from weather_journal.store import (
 )
 from weather_journal.stats import avg_temp, hottest_day, rainy_days
 
+# Exit code used for expected operational failures (bad input, API errors, ...).
+EXIT_FAILURE = 1
+
 
 def cmd_add(args):
     save_entry(args.city, args.temp, args.humidity, args.condition, db_path=args.db)
@@ -20,26 +23,27 @@ def cmd_add(args):
 def cmd_log(args):
     try:
         data = get_current(args.city, args.key)
-    except Exception as e:
-        print(f"Error fetching weather: {e}")
-        return
+    except ValueError as e:
+        print(f"Error fetching weather: {e}", file=sys.stderr)
+        return EXIT_FAILURE
 
     save_entry(
         data["city"], data["temp"], data["humidity"], data["condition"],
         db_path=args.db, location=data["location"],
     )
     print(f"Logged: {data['city']} - {data['temp']}°C, {data['humidity']}% humidity, {data['condition']}")
+    return 0
 
 
 def cmd_history(args):
     try:
         records = get_history(args.city, db_path=args.db)
     except AmbiguousLocationError as error:
-        print(error)
-        return
+        print(error, file=sys.stderr)
+        return EXIT_FAILURE
     if not records:
         print("No records found.")
-        return
+        return 0
 
     title = f"Weather History for {args.city}" if args.city else "All Weather History"
     print(f"\n{title}:")
@@ -49,16 +53,19 @@ def cmd_history(args):
     for r in records:
         print(f"{r['location_label']:<16} {r['temp']}°C{'':<6} {r['humidity']}%{'':<8} {r['condition']:<20} {r['logged_at']}")
 
+    print()
+    return 0
+
 
 def cmd_stats(args):
     try:
         records = get_history(args.city, db_path=args.db)
     except AmbiguousLocationError as error:
-        print(error)
-        return
+        print(error, file=sys.stderr)
+        return EXIT_FAILURE
     if not records:
         print(f"No records logged for '{args.city}'.")
-        return
+        return 0
 
     avg = avg_temp(records)
     hot = hottest_day(records)
@@ -71,9 +78,10 @@ def cmd_stats(args):
     if hot:
         print(f"  • Hottest Day: {hot['temp']}°C on {hot['logged_at']}")
     print(f"  • Rainy Observations: {rain}")
+    return 0
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description="Weather Journal CLI")
     parser.add_argument("--db", default=DEFAULT_DB_PATH, help="Path to sqlite database")
     subparsers = parser.add_subparsers(dest="command", help="Available subcommands")
@@ -102,13 +110,17 @@ def main():
     p_stats.add_argument("city", help="City name")
     p_stats.set_defaults(func=cmd_stats)
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if not args.command:
         parser.print_help()
-        sys.exit(0)
+        return 0
 
-    args.func(args)
+    # Command handlers return EXIT_FAILURE on expected operational failures so
+    # the exit code is nonzero; anything else propagates so bugs still crash
+    # loudly and are not swallowed by the CLI layer.
+    status = args.func(args)
+    return 0 if status is None else status
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
