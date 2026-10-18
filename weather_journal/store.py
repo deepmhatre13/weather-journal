@@ -7,6 +7,169 @@ from pathlib import Path
 DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "weather_journal.db"
 
 
+"""SQLite storage module for weather history.
+
+Schema versioning strategy
+--------------------------
+The schema version is tracked with SQLite's ``PRAGMA user_version``. Each
+version is a single, self-contained migration step.  The supported versions
+are recorded as a module-level list of (version, description) tuples in
+``SCHEMA_VERSIONS``; a new database is initialised to the latest version
+in that list, and every earlier version is upgraded by walking forward
+through the list.
+
+The application supports at most ``LATEST_SCHEMA_VERSION``.  A database that
+already carries a ``user_version`` greater than that value is treated as
+created by a future release and rejected with a clear error instead of being
+downgraded.
+
+Migration behaviour
+-------------------
+- ``get_connection()`` only performs migration work when the database's
+  ``user_version`` is lower than the latest supported version.  Completed
+  migrations are never reapplied during ordinary connections.
+- Every migration step is wrapped in an explicit transaction.  The schema
+  change and the accompanying ``PRAGMA user_version`` update are committed
+  together, so a failure rolls back both and a retry can safely complete the
+  step.
+- Ordinary reads and writes are unaffected: schema checks and migrations run
+  only at connection time, inside ``get_connection()``.
+"""
+
+import sqlite3
+from datetime import datetime
+from pathlib import Path
+
+DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "weather_journal.db"
+
+#: Ordered list of supported schema versions.  Each entry is a
+#: ``(description, [(sql, params), ...])`` tuple describing one migration
+#: step.  Index 0 is version 1 (the earliest shipped schema, a.k.a. the
+#: beginning-of-manifest version); index 1 is version 2 (the data migration
+#: that links legacy weather rows to explicit locations).
+SCHEMA_VERSIONS = [
+    # Version 1: the bootstrap schema.  Creates the two tables the application
+    # has always shipped.  ``entries.location_id`` is created up front for new
+    # databases; the guarded ALTER below only runs when a legacy table is
+    # missing the column.
+    (
+        "locations + entries bootstrap tables",
+        [
+            (
+                "CREATE TABLE IF NOT EXISTS locations ("
+                "    id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "    provider TEXT NOT NULL,"
+                "    provider_id TEXT,"
+                "    name TEXT NOT NULL,"
+                "    requested_name TEXT,"
+                "    country TEXT,"
+                "    latitude REAL,"
+                "    longitude REAL,"
+                "    location_label TEXT NOT NULL,"
+                "    UNIQUE(provider, provider_id)"
+                ");",
+                (),
+            ),
+            (
+                "CREATE TABLE IF NOT EXISTS entries ("
+                "    id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "    city TEXT NOT NULL,"
+                "    temp REAL NOT NULL,"
+                "    humidity INTEGER,"
+                "    condition TEXT,"
+                "    logged_at TEXT NOT NULL,"
+                "    location_id INTEGER REFERENCES locations(id)"
+                ");",
+                (),
+            ),
+            (
+                "ALTER TABLE entries ADD COLUMN location_id INTEGER REFERENCES locations(id);",
+                (),
+            ),
+        ],
+    ),
+    # Version 2: link every weather row that has no location to an explicit
+    # legacy location, one per distinct city.  Both statements are set-based so
+    # no per-row loop or runtime parameters are needed at migration time.
+    (
+        "tag legacy weather rows with explicit locations",
+        [
+            (
+                "INSERT OR IGNORE INTO locations"
+                " (provider, provider_id, name, requested_name, location_label)"
+                " SELECT 'legacy', LOWER(city), city, city, city || ' [legacy]'"
+                " FROM (SELECT DISTINCT city FROM entries WHERE location_id IS NULL);",
+                (),
+            ),
+            (
+                "UPDATE entries SET location_id = ("
+                "    SELECT id FROM locations"
+                "    WHERE provider = 'legacy' AND provider_id = LOWER(entries.city)"
+                ") WHERE location_id IS NULL;",
+                (),
+            ),
+        ],
+    ),
+]
+
+#: Latest schema version the application can apply.
+LATEST_SCHEMA_VERSION = len(SCHEMA_VERSIONS)
+
+#: The earliest schema version this release understands and can upgrade from.
+BOM_VERSION = 1
+
+
+def _get_schema_version(conn):
+    """Return the PRAGMA user_version of *conn* (0 for a brand-new DB)."""
+    return conn.execute("PRAGMA user_version").fetchone()[0]
+
+
+def _set_schema_version(conn, version):
+    """Set the PRAGMA user_version and commit the change to disk."""
+    conn.execute(f"PRAGMA user_version = {version}")
+    conn.commit()
+
+
+def _table_exists(conn, table):
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table,),
+    ).fetchone()
+    return row is not None
+
+
+def _apply_migration_step(conn, index):
+    """Apply migration step *index* inside a single transaction.
+
+    Runs the step's statements, advances ``PRAGMA user_version`` to
+    ``index + 1``, and commits both together.  Any failure rolls the whole
+    step back (schema change and version bump) and re-raises, so the database
+    is never left partially migrated and a retry can safely resume.
+    """
+    _description, statements = SCHEMA_VERSIONS[index]
+    conn.execute("BEGIN")
+    try:
+        for statement, params in statements:
+            if statement.startswith("ALTER TABLE entries ADD COLUMN location_id"):
+                # Skip when the column already exists so the step stays
+                # idempotent across fresh databases (CREATE included it) and
+                # legacy databases that already carry the column.
+                if _table_exists(conn, "entries"):
+                    columns = {
+                        row["name"]
+                        for row in conn.execute("PRAGMA table_info(entries)")
+                    }
+                    if "location_id" in columns:
+                        continue
+            conn.execute(statement, params or ())
+        _set_schema_version(conn, index + 1)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return True
+
+
 class AmbiguousLocationError(ValueError):
     """Raised when a name refers to more than one stored location."""
 
@@ -44,67 +207,57 @@ def _selector_label(location):
 
 
 def get_connection(db_path=DEFAULT_DB_PATH):
-    """Establish a connection and migrate older databases in place."""
+    """Establish a connection and migrate older databases in place.
+
+    A brand-new database is initialised to the latest supported schema.
+    Older databases are upgraded by walking forward through the supported
+    versions.  A database whose schema version is newer than this
+    application supports is rejected with a clear error rather than being
+    downgraded.
+    """
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS locations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            provider TEXT NOT NULL,
-            provider_id TEXT,
-            name TEXT NOT NULL,
-            requested_name TEXT,
-            country TEXT,
-            latitude REAL,
-            longitude REAL,
-            location_label TEXT NOT NULL,
-            UNIQUE(provider, provider_id)
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS entries (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            city TEXT NOT NULL,
-            temp REAL NOT NULL,
-            humidity INTEGER,
-            condition TEXT,
-            logged_at TEXT NOT NULL,
-            location_id INTEGER REFERENCES locations(id)
-        )
-    """)
 
-    columns = {row["name"] for row in cursor.execute("PRAGMA table_info(entries)")}
-    if "location_id" not in columns:
-        cursor.execute("ALTER TABLE entries ADD COLUMN location_id INTEGER REFERENCES locations(id)")
+    try:
+        version = _get_schema_version(conn)
 
-    # Older rows have only a city name. Preserve them under an explicit legacy
-    # identity; there is not enough information to guess their real location.
-    legacy_cities = cursor.execute(
-        "SELECT DISTINCT city FROM entries WHERE location_id IS NULL"
-    ).fetchall()
-    for row in legacy_cities:
-        city = row["city"]
-        provider_id = city.casefold()
-        label = f"{city} [legacy]"
-        cursor.execute("""
-            INSERT OR IGNORE INTO locations
-                (provider, provider_id, name, requested_name, location_label)
-            VALUES ('legacy', ?, ?, ?, ?)
-        """, (provider_id, city, city, label))
-        location_id = cursor.execute(
-            "SELECT id FROM locations WHERE provider = 'legacy' AND provider_id = ?",
-            (provider_id,),
-        ).fetchone()["id"]
-        cursor.execute(
-            "UPDATE entries SET location_id = ? WHERE location_id IS NULL AND LOWER(city) = LOWER(?)",
-            (location_id, city),
-        )
+        if version == 0:
+            # Fresh database: apply every supported migration from scratch.
+            for index in range(LATEST_SCHEMA_VERSION):
+                _apply_migration_step(conn, index)
 
-    conn.commit()
+        elif version < BOM_VERSION:
+            # A database the application can never understand: refuse instead
+            # of attempting an unsafe downgrade.
+            raise ValueError(
+                f"Database schema version {version} is older than the earliest "
+                f"version this application supports ({BOM_VERSION}). "
+                "The database file was created by an incompatible older release "
+                "and cannot be opened. Restore the database from a backup."
+            )
+
+        elif version < LATEST_SCHEMA_VERSION:
+            # Supported, older database: apply the missing steps one at a time.
+            for index in range(version, LATEST_SCHEMA_VERSION):
+                _apply_migration_step(conn, index)
+
+        elif version > LATEST_SCHEMA_VERSION:
+            # A future-release database: reject rather than downgrade.
+            raise ValueError(
+                f"Database schema version {version} is newer than the latest "
+                f"supported version ({LATEST_SCHEMA_VERSION}). The database was "
+                f"created by a newer release of Weather Journal and cannot be "
+                f"opened by this version. Upgrade (or restore a copy of) the "
+                f"database."
+            )
+    except Exception:
+        # Do not leak the connection handle when migration or validation fails.
+        conn.close()
+        raise
+
     return conn
 
 
